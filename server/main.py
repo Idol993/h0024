@@ -397,14 +397,23 @@ def confirm_order(data: InboundConfirm, db: Session = Depends(get_db)):
     if not order:
         raise HTTPException(404, "订单不存在")
     if order.status == "completed":
-        raise HTTPException(400, "订单已完成")
+        raise HTTPException(400, "订单已完成，不可重复收货")
     if data.received_qty <= 0:
         raise HTTPException(400, "到货量必须大于0")
 
-    order.received_qty += data.received_qty
+    pending_qty = round(order.order_qty - order.received_qty, 3)
+    if data.received_qty > pending_qty:
+        raise HTTPException(
+            400,
+            f"本次到货量({data.received_qty})超过剩余待收货量({pending_qty})，"
+            f"原订货量={order.order_qty}，已到货={order.received_qty}，"
+            f"本次最多可收={pending_qty}"
+        )
+
+    order.received_qty = round(order.received_qty + data.received_qty, 3)
     order.unit_price = data.unit_price
     order.confirmed_at = datetime.now()
-    if order.received_qty >= order.order_qty:
+    if abs(order.received_qty - order.order_qty) < 0.001:
         order.status = "completed"
     else:
         order.status = "partial"
@@ -413,7 +422,7 @@ def confirm_order(data: InboundConfirm, db: Session = Depends(get_db)):
     if not stock:
         stock = Stock(ingredient_id=order.ingredient_id, current_qty=0.0)
         db.add(stock)
-    stock.current_qty += data.received_qty
+    stock.current_qty = round(stock.current_qty + data.received_qty, 3)
     stock.last_inbound_at = datetime.now()
     stock.last_unit_price = data.unit_price
 
@@ -421,7 +430,9 @@ def confirm_order(data: InboundConfirm, db: Session = Depends(get_db)):
     return {"code": 0, "data": {
         "order_id": order.id,
         "status": order.status,
+        "order_qty": order.order_qty,
         "total_received": order.received_qty,
+        "remaining_pending": round(order.order_qty - order.received_qty, 3),
         "current_stock": stock.current_qty
     }}
 
@@ -590,6 +601,7 @@ def restock_alert(db: Session = Depends(get_db)):
     backup_database()
     today = date.today()
     seven_days_ago = today - timedelta(days=7)
+    tomorrow = today + timedelta(days=1)
 
     ingredients = db.query(Ingredient).all()
     alerts = []
@@ -605,30 +617,82 @@ def restock_alert(db: Session = Depends(get_db)):
 
         stock = db.query(Stock).filter(Stock.ingredient_id == ing.id).first()
         current_qty = stock.current_qty if stock else 0.0
+        last_unit_price = stock.last_unit_price if stock and stock.last_unit_price > 0 else ing.unit_cost
 
+        fl = db.query(ForecastLog).filter(
+            ForecastLog.ingredient_id == ing.id,
+            ForecastLog.forecast_date == tomorrow
+        ).first()
+        forecast_qty = fl.forecast_qty if fl else None
+
+        pending_orders = db.query(Order).filter(
+            Order.ingredient_id == ing.id,
+            Order.status != "completed"
+        ).all()
+        in_transit_qty = round(sum(o.order_qty - o.received_qty for o in pending_orders), 3)
+
+        effective_qty = round(current_qty + in_transit_qty, 3)
         safety_qty = daily_avg * ing.safety_stock_days
-        shortfall = safety_qty - current_qty
+        shortfall = round(safety_qty - effective_qty, 3)
 
-        if shortfall > 0 and daily_avg > 0:
-            suggest_qty = round(max(shortfall, daily_avg * ing.safety_stock_days * 1.5), 2)
+        if forecast_qty and forecast_qty > 0:
+            days_supported = round(effective_qty / forecast_qty, 1)
+        elif daily_avg > 0:
+            days_supported = round(effective_qty / daily_avg, 1)
+        else:
+            days_supported = 999
+
+        if daily_avg <= 0 and (forecast_qty is None or forecast_qty <= 0):
+            continue
+
+        if shortfall > 0:
+            if forecast_qty and forecast_qty > 0:
+                suggest_qty = round(max(shortfall, forecast_qty * ing.safety_stock_days * 1.2), 2)
+            else:
+                suggest_qty = round(max(shortfall, daily_avg * ing.safety_stock_days * 1.5), 2)
+
+            if ing.shelf_life_days > 0 and daily_avg > 0:
+                max_reasonable = round(daily_avg * ing.shelf_life_days, 2)
+                if suggest_qty > max_reasonable:
+                    suggest_qty = max_reasonable
+
+            if days_supported <= 1:
+                risk_level = "urgent"
+            elif days_supported <= ing.safety_stock_days:
+                risk_level = "high"
+            elif days_supported <= ing.safety_stock_days * 2:
+                risk_level = "medium"
+            else:
+                risk_level = "low"
+
             alerts.append({
                 "ingredient_id": ing.id,
                 "ingredient_name": ing.name,
                 "category": ing.category,
                 "unit": ing.unit,
                 "current_stock": round(current_qty, 3),
+                "in_transit_qty": in_transit_qty,
+                "effective_qty": effective_qty,
                 "daily_avg_7d": round(daily_avg, 3),
+                "forecast_qty_tomorrow": round(forecast_qty, 3) if forecast_qty else None,
                 "safety_stock_days": ing.safety_stock_days,
+                "shelf_life_days": ing.shelf_life_days,
                 "safety_qty": round(safety_qty, 3),
-                "shortfall": round(shortfall, 3),
+                "shortfall": shortfall,
                 "suggested_purchase_qty": suggest_qty,
-                "estimated_cost": round(suggest_qty * (ing.unit_cost or (stock.last_unit_price if stock else 0)), 2)
+                "days_supported": days_supported,
+                "risk_level": risk_level,
+                "last_unit_price": last_unit_price,
+                "estimated_cost": round(suggest_qty * last_unit_price, 2)
             })
 
-    alerts.sort(key=lambda x: x["shortfall"], reverse=True)
+    risk_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+    alerts.sort(key=lambda x: (risk_order.get(x["risk_level"], 9), -x["shortfall"]))
     return {"code": 0, "data": {
         "generated_at": datetime.now().isoformat(),
         "total_alerts": len(alerts),
+        "urgent_count": sum(1 for a in alerts if a["risk_level"] == "urgent"),
+        "high_count": sum(1 for a in alerts if a["risk_level"] == "high"),
         "total_estimated_cost": round(sum(a["estimated_cost"] for a in alerts), 2),
         "items": alerts
     }}

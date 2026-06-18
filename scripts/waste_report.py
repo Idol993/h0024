@@ -87,8 +87,10 @@ def get_date_range(period: str = "last_week") -> tuple:
 
 
 def load_data(db: Session, start: date, end: date) -> Dict[str, pd.DataFrame]:
+    extended_start = start - timedelta(days=(end - start).days + 1)
+
     wastes = db.query(Waste).filter(
-        and_(Waste.waste_date >= start, Waste.waste_date <= end)
+        and_(Waste.waste_date >= extended_start, Waste.waste_date <= end)
     ).all()
     waste_data = []
     for w in wastes:
@@ -111,7 +113,7 @@ def load_data(db: Session, start: date, end: date) -> Dict[str, pd.DataFrame]:
     df_waste = pd.DataFrame(waste_data)
 
     outbounds = db.query(Outbound).filter(
-        and_(Outbound.outbound_date >= start, Outbound.outbound_date <= end)
+        and_(Outbound.outbound_date >= extended_start, Outbound.outbound_date <= end)
     ).all()
     ob_data = []
     for o in outbounds:
@@ -141,12 +143,26 @@ def load_data(db: Session, start: date, end: date) -> Dict[str, pd.DataFrame]:
         })
     df_stock = pd.DataFrame(stk_data)
 
-    return {"waste": df_waste, "outbound": df_ob, "stock": df_stock}
+    return {"waste": df_waste, "outbound": df_ob, "stock": df_stock, "report_start": start, "report_end": end}
 
 
 def analyze(dfs: Dict[str, pd.DataFrame], start: date, end: date) -> Dict:
-    df_w = dfs["waste"]
-    df_ob = dfs["outbound"]
+    df_w_all = dfs["waste"]
+    df_ob_all = dfs["outbound"]
+
+    if not df_ob_all.empty:
+        df_ob_all = df_ob_all.copy()
+        df_ob_all["value"] = df_ob_all["qty"] * df_ob_all["unit_cost"]
+
+    if not df_w_all.empty:
+        df_w = df_w_all[(df_w_all["waste_date"] >= start) & (df_w_all["waste_date"] <= end)].copy()
+    else:
+        df_w = df_w_all
+
+    if not df_ob_all.empty:
+        df_ob = df_ob_all[(df_ob_all["outbound_date"] >= start) & (df_ob_all["outbound_date"] <= end)].copy()
+    else:
+        df_ob = df_ob_all
     result = {
         "period": f"{start.isoformat()} ~ {end.isoformat()}",
         "days": (end - start).days + 1,
@@ -226,28 +242,35 @@ def analyze(dfs: Dict[str, pd.DataFrame], start: date, end: date) -> Dict:
         ).sort_values("waste_date").to_dict("records")
 
         flagged_stores = []
-        two_weeks_ago_start = start - timedelta(days=14)
+        prev_start = start - timedelta(days=(end - start).days + 1)
+        prev_end = start - timedelta(days=1)
         for s_data in result["by_store"]:
-            if s_data["waste_rate"] > 5:
-                last_2w_waste = 0
-                last_2w_ob = 0
-                if not df_w.empty:
-                    last_2w_waste = df_w[
-                        (df_w["store_id"] == s_data["store_id"]) &
-                        (df_w["waste_date"] >= two_weeks_ago_start)
-                    ]["waste_amount"].sum()
-                if not df_ob.empty:
-                    last_2w_ob = df_ob[
-                        (df_ob["store_id"] == s_data["store_id"]) &
-                        (df_ob["outbound_date"] >= two_weeks_ago_start)
-                    ]["value"].sum()
-                two_week_rate = round(last_2w_waste / last_2w_ob * 100, 2) if last_2w_ob > 0 else 0
-                if two_week_rate > 5:
-                    flagged_stores.append({
-                        **s_data,
-                        "two_week_waste_rate": two_week_rate,
-                        "consecutive_high": True
-                    })
+            if s_data["waste_rate"] <= 5:
+                continue
+            prev_w_val = 0
+            prev_ob_val = 0
+            if not df_w_all.empty:
+                prev_w_val = df_w_all[
+                    (df_w_all["store_id"] == s_data["store_id"]) &
+                    (df_w_all["waste_date"] >= prev_start) &
+                    (df_w_all["waste_date"] <= prev_end)
+                ]["waste_amount"].sum()
+            if not df_ob_all.empty:
+                prev_ob_val = df_ob_all[
+                    (df_ob_all["store_id"] == s_data["store_id"]) &
+                    (df_ob_all["outbound_date"] >= prev_start) &
+                    (df_ob_all["outbound_date"] <= prev_end)
+                ]["value"].sum()
+            prev_rate = round(prev_w_val / prev_ob_val * 100, 2) if prev_ob_val > 0 else 0
+            if prev_rate > 5:
+                flagged_stores.append({
+                    **s_data,
+                    "prev_period": f"{prev_start.isoformat()} ~ {prev_end.isoformat()}",
+                    "prev_waste_rate": prev_rate,
+                    "prev_waste_amount": round(prev_w_val, 2),
+                    "prev_outbound_value": round(prev_ob_val, 2),
+                    "consecutive_high": True
+                })
         result["flagged_stores"] = flagged_stores
 
     return result
@@ -405,8 +428,14 @@ def build_markdown(result: Dict, chart_files: List[str], excel_path: str, prefix
 
     if "flagged_stores" in result and result["flagged_stores"]:
         lines.append("\n### ⚠️ 连续两周高损耗门店预警\n")
+        lines.append("| 门店 | 当期损耗率 | 上期损耗率 | 上期周期 | 当期损耗金额 | 上期损耗金额 |")
+        lines.append("|------|------------|------------|----------|--------------|--------------|")
         for x in result["flagged_stores"]:
-            lines.append(f"- **{x['store_id']}**：当期 {x['waste_rate']:.2f}%，近两周 {x['two_week_waste_rate']:.2f}%，持续高于警戒线 5%，**建议管理组现场核查**")
+            lines.append(
+                f"| {x['store_id']} | {x['waste_rate']:.2f}% 🔴 | {x['prev_waste_rate']:.2f}% 🔴 | "
+                f"{x['prev_period']} | ¥{x['waste_amount']:,.2f} | ¥{x['prev_waste_amount']:,.2f} |"
+            )
+        lines.append("\n> 上述门店连续两周损耗率均超过5%警戒线，**建议管理组现场核查**")
 
     lines.append("\n## 六、月度趋势\n")
     if "by_month" in result and result["by_month"]:
@@ -493,8 +522,10 @@ def print_console_summary(result: Dict):
 
     if "flagged_stores" in result and result["flagged_stores"]:
         print("\n⚠️  【高损耗预警门店 - 连续两周 > 5%】")
+        tbl = []
         for s in result["flagged_stores"]:
-            print(f"  🔴 {s['store_id']}  当期 {s['waste_rate']:.2f}%  |  近两周 {s['two_week_waste_rate']:.2f}%")
+            tbl.append([s["store_id"], f"{s['waste_rate']:.2f}%", f"{s['prev_waste_rate']:.2f}%", s["prev_period"], f"¥{s['waste_amount']:,.2f}", f"¥{s['prev_waste_amount']:,.2f}"])
+        print(tabulate(tbl, headers=["门店", "当期损耗率", "上期损耗率", "上期周期", "当期金额", "上期金额"], tablefmt="github"))
 
     if "by_store" in result and result["by_store"]:
         print("\n【各门店损耗率】")
