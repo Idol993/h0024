@@ -523,7 +523,7 @@ def main():
     md_path = REPORT_DIR / f"{prefix}.md"
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(data["markdown"])
-    excel_path = export_excel(restock, fcerrors, stores, prefix)
+    excel_path = export_excel(restock, fcerrors, stores, prefix, rd)
 
     print(f"\n📄 Markdown 报告: {md_path}")
     print(f"📊 Excel 明细: {excel_path}")
