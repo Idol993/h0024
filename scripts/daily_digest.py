@@ -48,10 +48,10 @@ def load_smtp_config() -> Optional[Dict]:
     }
 
 
-def get_restock_alerts(db: Session) -> Dict:
-    today = date.today()
-    seven_days_ago = today - timedelta(days=7)
-    tomorrow = today + timedelta(days=1)
+def get_restock_alerts(db: Session, report_date: Optional[date] = None) -> Dict:
+    rd = report_date or date.today()
+    seven_days_ago = rd - timedelta(days=7)
+    tomorrow = rd + timedelta(days=1)
 
     ingredients = db.query(Ingredient).all()
     alerts = []
@@ -59,7 +59,7 @@ def get_restock_alerts(db: Session) -> Dict:
         consumed = db.query(Outbound).filter(
             Outbound.ingredient_id == ing.id,
             Outbound.outbound_date >= seven_days_ago,
-            Outbound.outbound_date < today
+            Outbound.outbound_date < rd
         ).all()
         total_consumed = sum(c.qty for c in consumed)
         daily_avg = total_consumed / 7.0 if total_consumed > 0 else 0
@@ -74,7 +74,9 @@ def get_restock_alerts(db: Session) -> Dict:
         forecast_qty = fl.forecast_qty if fl else None
 
         pending_orders = db.query(Order).filter(
-            Order.ingredient_id == ing.id, Order.status != "completed"
+            Order.ingredient_id == ing.id,
+            Order.order_date <= rd,
+            Order.status != "completed"
         ).all()
         in_transit_qty = round(sum(o.order_qty - o.received_qty for o in pending_orders), 3)
         effective_qty = round(current_qty + in_transit_qty, 3)
@@ -148,11 +150,11 @@ def get_restock_alerts(db: Session) -> Dict:
     }
 
 
-def get_forecast_errors(db: Session) -> Dict:
-    today = date.today()
-    seven_days_ago = today - timedelta(days=7)
+def get_forecast_errors(db: Session, report_date: Optional[date] = None) -> Dict:
+    rd = report_date or date.today()
+    seven_days_ago = rd - timedelta(days=7)
     logs = db.query(ForecastLog).filter(
-        and_(ForecastLog.is_flagged == True, ForecastLog.forecast_date >= seven_days_ago)
+        and_(ForecastLog.is_flagged == True, ForecastLog.forecast_date >= seven_days_ago, ForecastLog.forecast_date <= rd)
     ).order_by(ForecastLog.forecast_date.desc()).all()
 
     counter: Dict[int, Dict] = {}
@@ -182,12 +184,12 @@ def get_forecast_errors(db: Session) -> Dict:
         c["last_error_rate"] = round(c["last_error_rate"] * 100, 2)
         items.append(c)
     items.sort(key=lambda x: x["flagged_count"], reverse=True)
-    return {"total": len(items), "items": items, "period": f"{seven_days_ago.isoformat()} ~ {today.isoformat()}"}
+    return {"total": len(items), "items": items, "period": f"{seven_days_ago.isoformat()} ~ {rd.isoformat()}"}
 
 
-def get_flagged_stores(db: Session, period_days: int = 7) -> Dict:
-    today = date.today()
-    end = today
+def get_flagged_stores(db: Session, period_days: int = 7, report_date: Optional[date] = None) -> Dict:
+    rd = report_date or date.today()
+    end = rd
     start = end - timedelta(days=period_days - 1)
     prev_start = start - timedelta(days=period_days)
     prev_end = start - timedelta(days=1)
@@ -414,11 +416,12 @@ def print_console(restock: Dict, fcerrors: Dict, stores: Dict, report_date: date
     print("\n" + "=" * 80)
 
 
-def export_excel(restock: Dict, fcerrors: Dict, stores: Dict, prefix: str) -> str:
+def export_excel(restock: Dict, fcerrors: Dict, stores: Dict, prefix: str, report_date: Optional[date] = None) -> str:
+    rd = report_date or date.today()
     excel_path = REPORT_DIR / f"{prefix}_daily_digest.xlsx"
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
         summary = [{
-            "报告日期": date.today().isoformat(),
+            "报告日期": rd.isoformat(),
             "需补货原料数": restock["total"],
             "紧急补货": restock["urgent_count"],
             "高风险补货": restock["high_count"],
@@ -483,9 +486,9 @@ def generate_digest(report_date: Optional[date] = None) -> Dict:
     db = SessionLocal()
     try:
         rd = report_date or date.today()
-        restock = get_restock_alerts(db)
-        fcerrors = get_forecast_errors(db)
-        stores = get_flagged_stores(db)
+        restock = get_restock_alerts(db, rd)
+        fcerrors = get_forecast_errors(db, rd)
+        stores = get_flagged_stores(db, report_date=rd)
         md = build_markdown(restock, fcerrors, stores, rd)
         return {
             "report_date": rd.isoformat(),
@@ -494,6 +497,7 @@ def generate_digest(report_date: Optional[date] = None) -> Dict:
             "restock": restock,
             "forecast_errors": fcerrors,
             "stores": stores,
+            "_report_date_obj": rd,
         }
     finally:
         db.close()
