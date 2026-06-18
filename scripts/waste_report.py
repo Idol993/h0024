@@ -165,12 +165,16 @@ def analyze(dfs: Dict[str, pd.DataFrame], start: date, end: date) -> Dict:
         df_ob = df_ob_all
     result = {
         "period": f"{start.isoformat()} ~ {end.isoformat()}",
+        "period_start": start,
+        "period_end": end,
         "days": (end - start).days + 1,
         "total_waste_amount": 0.0,
         "total_waste_qty": 0.0,
         "total_waste_count": 0,
         "total_outbound_value": 0.0,
         "overall_waste_rate": 0.0,
+        "_df_waste": df_w,
+        "_df_outbound": df_ob,
     }
 
     if df_w.empty and df_ob.empty:
@@ -348,7 +352,7 @@ def make_charts(dfs: Dict[str, pd.DataFrame], result: Dict, report_dir: Path, pr
 
 
 def export_excel(dfs: Dict[str, pd.DataFrame], result: Dict, report_dir: Path, prefix: str) -> str:
-    df_w = dfs["waste"]
+    df_w = result.get("_df_waste", dfs["waste"])
     excel_path = report_dir / f"{prefix}_waste_report.xlsx"
     with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
         summary_df = pd.DataFrame([{

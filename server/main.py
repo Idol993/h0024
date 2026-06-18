@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, DateTime, Date, ForeignKey, Text, Boolean
+    create_engine, Column, Integer, String, Float, DateTime, Date, ForeignKey, Text, Boolean, and_
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from pydantic import BaseModel, Field
@@ -632,27 +632,32 @@ def restock_alert(db: Session = Depends(get_db)):
         in_transit_qty = round(sum(o.order_qty - o.received_qty for o in pending_orders), 3)
 
         effective_qty = round(current_qty + in_transit_qty, 3)
-        safety_qty = daily_avg * ing.safety_stock_days
+
+        has_consumption_data = daily_avg > 0 or (forecast_qty and forecast_qty > 0)
+        if not has_consumption_data:
+            continue
+
+        safety_from_avg = daily_avg * ing.safety_stock_days
+        safety_from_forecast = (forecast_qty if forecast_qty and forecast_qty > 0 else 0) * 1
+        safety_qty = round(max(safety_from_avg, safety_from_forecast), 3)
         shortfall = round(safety_qty - effective_qty, 3)
 
-        if forecast_qty and forecast_qty > 0:
-            days_supported = round(effective_qty / forecast_qty, 1)
-        elif daily_avg > 0:
-            days_supported = round(effective_qty / daily_avg, 1)
+        effective_daily = forecast_qty if forecast_qty and forecast_qty > 0 else daily_avg
+        if effective_daily > 0:
+            days_supported = round(effective_qty / effective_daily, 1)
         else:
             days_supported = 999
 
-        if daily_avg <= 0 and (forecast_qty is None or forecast_qty <= 0):
-            continue
-
-        if shortfall > 0:
-            if forecast_qty and forecast_qty > 0:
+        if shortfall > 0 or (forecast_qty and forecast_qty > 0 and effective_qty < forecast_qty):
+            if forecast_qty and forecast_qty > 0 and daily_avg <= 0:
+                suggest_qty = round(forecast_qty * ing.safety_stock_days * 1.2, 2)
+            elif forecast_qty and forecast_qty > 0:
                 suggest_qty = round(max(shortfall, forecast_qty * ing.safety_stock_days * 1.2), 2)
             else:
                 suggest_qty = round(max(shortfall, daily_avg * ing.safety_stock_days * 1.5), 2)
 
-            if ing.shelf_life_days > 0 and daily_avg > 0:
-                max_reasonable = round(daily_avg * ing.shelf_life_days, 2)
+            if ing.shelf_life_days > 0 and effective_daily > 0:
+                max_reasonable = round(effective_daily * ing.shelf_life_days, 2)
                 if suggest_qty > max_reasonable:
                     suggest_qty = max_reasonable
 
@@ -677,7 +682,7 @@ def restock_alert(db: Session = Depends(get_db)):
                 "forecast_qty_tomorrow": round(forecast_qty, 3) if forecast_qty else None,
                 "safety_stock_days": ing.safety_stock_days,
                 "shelf_life_days": ing.shelf_life_days,
-                "safety_qty": round(safety_qty, 3),
+                "safety_qty": safety_qty,
                 "shortfall": shortfall,
                 "suggested_purchase_qty": suggest_qty,
                 "days_supported": days_supported,
@@ -870,6 +875,289 @@ def list_stocktake(
             "operator": s.operator
         } for s in items
     ]}
+
+
+# ========== 每日运营摘要 ==========
+
+@app.get("/api/daily-digest", tags=["每日运营摘要"])
+def daily_digest(
+    report_date: Optional[str] = Query(None, description="报告日期 YYYY-MM-DD，默认今天"),
+    markdown_only: bool = Query(False, description="是否仅返回Markdown文本"),
+    db: Session = Depends(get_db)
+):
+    import pandas as pd
+    rd = dateparse(report_date).date() if report_date else date.today()
+    today = date.today()
+    seven_days_ago = today - timedelta(days=7)
+    tomorrow = today + timedelta(days=1)
+
+    restock_alerts = []
+    ingredients = db.query(Ingredient).all()
+    for ing in ingredients:
+        consumed = db.query(Outbound).filter(
+            Outbound.ingredient_id == ing.id,
+            Outbound.outbound_date >= seven_days_ago,
+            Outbound.outbound_date < today
+        ).all()
+        total_consumed = sum(c.qty for c in consumed)
+        daily_avg = total_consumed / 7.0 if total_consumed > 0 else 0
+        stock = db.query(Stock).filter(Stock.ingredient_id == ing.id).first()
+        current_qty = stock.current_qty if stock else 0.0
+        last_unit_price = stock.last_unit_price if stock and stock.last_unit_price > 0 else ing.unit_cost
+        fl = db.query(ForecastLog).filter(ForecastLog.ingredient_id == ing.id, ForecastLog.forecast_date == tomorrow).first()
+        forecast_qty = fl.forecast_qty if fl else None
+        pending_orders = db.query(Order).filter(Order.ingredient_id == ing.id, Order.status != "completed").all()
+        in_transit_qty = round(sum(o.order_qty - o.received_qty for o in pending_orders), 3)
+        effective_qty = round(current_qty + in_transit_qty, 3)
+        has_data = daily_avg > 0 or (forecast_qty and forecast_qty > 0)
+        if not has_data:
+            continue
+        safety_from_avg = daily_avg * ing.safety_stock_days
+        safety_from_forecast = (forecast_qty if forecast_qty and forecast_qty > 0 else 0)
+        safety_qty = round(max(safety_from_avg, safety_from_forecast), 3)
+        shortfall = round(safety_qty - effective_qty, 3)
+        effective_daily = forecast_qty if forecast_qty and forecast_qty > 0 else daily_avg
+        if effective_daily > 0:
+            days_supported = round(effective_qty / effective_daily, 1)
+        else:
+            days_supported = 999
+        need_alert = shortfall > 0 or (forecast_qty and forecast_qty > 0 and effective_qty < forecast_qty)
+        if not need_alert:
+            continue
+        if forecast_qty and forecast_qty > 0 and daily_avg <= 0:
+            suggest_qty = round(forecast_qty * ing.safety_stock_days * 1.2, 2)
+        elif forecast_qty and forecast_qty > 0:
+            suggest_qty = round(max(shortfall, forecast_qty * ing.safety_stock_days * 1.2), 2)
+        else:
+            suggest_qty = round(max(shortfall, daily_avg * ing.safety_stock_days * 1.5), 2)
+        if ing.shelf_life_days > 0 and effective_daily > 0:
+            max_reasonable = round(effective_daily * ing.shelf_life_days, 2)
+            if suggest_qty > max_reasonable:
+                suggest_qty = max_reasonable
+        if days_supported <= 1:
+            risk = "urgent"
+        elif days_supported <= ing.safety_stock_days:
+            risk = "high"
+        elif days_supported <= ing.safety_stock_days * 2:
+            risk = "medium"
+        else:
+            risk = "low"
+        restock_alerts.append({
+            "ingredient_id": ing.id, "ingredient_name": ing.name, "category": ing.category,
+            "unit": ing.unit, "current_stock": round(current_qty, 3),
+            "in_transit_qty": in_transit_qty, "effective_qty": effective_qty,
+            "daily_avg_7d": round(daily_avg, 3),
+            "forecast_qty_tomorrow": round(forecast_qty, 3) if forecast_qty else None,
+            "safety_stock_days": ing.safety_stock_days, "shelf_life_days": ing.shelf_life_days,
+            "shortfall": shortfall, "suggested_purchase_qty": suggest_qty,
+            "days_supported": days_supported, "risk_level": risk,
+            "last_unit_price": last_unit_price, "estimated_cost": round(suggest_qty * last_unit_price, 2)
+        })
+    risk_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+    restock_alerts.sort(key=lambda x: (risk_order.get(x["risk_level"], 9), -x["shortfall"]))
+    restock = {
+        "total": len(restock_alerts),
+        "urgent_count": sum(1 for a in restock_alerts if a["risk_level"] == "urgent"),
+        "high_count": sum(1 for a in restock_alerts if a["risk_level"] == "high"),
+        "total_estimated_cost": round(sum(a["estimated_cost"] for a in restock_alerts), 2),
+        "items": restock_alerts
+    }
+
+    fc_logs = db.query(ForecastLog).filter(
+        and_(ForecastLog.is_flagged == True, ForecastLog.forecast_date >= seven_days_ago)
+    ).order_by(ForecastLog.forecast_date.desc()).all()
+    fc_counter: Dict[int, Dict] = {}
+    for fl in fc_logs:
+        if fl.ingredient_id not in fc_counter:
+            fc_counter[fl.ingredient_id] = {
+                "ingredient_id": fl.ingredient_id,
+                "ingredient_name": fl.ingredient.name if fl.ingredient else "",
+                "category": fl.ingredient.category if fl.ingredient else "",
+                "flagged_count": 0, "avg_error_rate": 0.0,
+                "last_error_rate": 0.0, "last_date": None,
+                "last_forecast": 0, "last_actual": 0,
+            }
+        c = fc_counter[fl.ingredient_id]
+        c["flagged_count"] += 1
+        c["last_error_rate"] = fl.error_rate or 0
+        c["avg_error_rate"] += (fl.error_rate or 0)
+        c["last_date"] = fl.forecast_date.isoformat()
+        c["last_forecast"] = fl.forecast_qty
+        c["last_actual"] = fl.actual_qty if fl.actual_qty is not None else 0
+    fc_items = []
+    for c in fc_counter.values():
+        c["avg_error_rate"] = round(c["avg_error_rate"] / c["flagged_count"] * 100, 2)
+        c["last_error_rate"] = round(c["last_error_rate"] * 100, 2)
+        fc_items.append(c)
+    fc_items.sort(key=lambda x: x["flagged_count"], reverse=True)
+    fcerrors = {"total": len(fc_items), "items": fc_items, "period": f"{seven_days_ago.isoformat()} ~ {today.isoformat()}"}
+
+    period_days = 7
+    end = today
+    start = end - timedelta(days=period_days - 1)
+    prev_start = start - timedelta(days=period_days)
+    prev_end = start - timedelta(days=1)
+    wastes = db.query(Waste).filter(Waste.waste_date >= prev_start, Waste.waste_date <= end).all()
+    outbounds = db.query(Outbound).filter(Outbound.outbound_date >= prev_start, Outbound.outbound_date <= end).all()
+    w_data = []
+    for w in wastes:
+        w_data.append({"store_id": w.store_id, "waste_amount": w.waste_amount, "waste_date": w.waste_date})
+    df_w = pd.DataFrame(w_data)
+    ob_data = []
+    for o in outbounds:
+        ing = o.ingredient
+        cost = ing.unit_cost if ing else 0
+        ob_data.append({"store_id": o.store_id, "outbound_date": o.outbound_date, "value": o.qty * cost})
+    df_ob = pd.DataFrame(ob_data)
+    if not df_w.empty and not df_ob.empty:
+        if not df_w.empty:
+            df_w_curr = df_w[(df_w["waste_date"] >= start) & (df_w["waste_date"] <= end)]
+            df_w_prev = df_w[(df_w["waste_date"] >= prev_start) & (df_w["waste_date"] <= prev_end)]
+        else:
+            df_w_curr = df_w
+            df_w_prev = df_w
+        if not df_ob.empty:
+            df_ob_curr = df_ob[(df_ob["outbound_date"] >= start) & (df_ob["outbound_date"] <= end)]
+            df_ob_prev = df_ob[(df_ob["outbound_date"] >= prev_start) & (df_ob["outbound_date"] <= prev_end)]
+        else:
+            df_ob_curr = df_ob
+            df_ob_prev = df_ob
+        all_stores = list(set(
+            (df_w_curr["store_id"].tolist() if not df_w_curr.empty else []) +
+            (df_ob_curr["store_id"].tolist() if not df_ob_curr.empty else []) +
+            (df_w_prev["store_id"].tolist() if not df_w_prev.empty else []) +
+            (df_ob_prev["store_id"].tolist() if not df_ob_prev.empty else [])
+        ))
+        items = []
+        flagged = []
+        for sid in sorted(all_stores):
+            curr_w = df_w_curr[df_w_curr["store_id"] == sid]["waste_amount"].sum() if not df_w_curr.empty else 0
+            curr_ob = df_ob_curr[df_ob_curr["store_id"] == sid]["value"].sum() if not df_ob_curr.empty else 0
+            prev_w = df_w_prev[df_w_prev["store_id"] == sid]["waste_amount"].sum() if not df_w_prev.empty else 0
+            prev_ob = df_ob_prev[df_ob_prev["store_id"] == sid]["value"].sum() if not df_ob_prev.empty else 0
+            curr_rate = round(curr_w / curr_ob * 100, 2) if curr_ob > 0 else 0
+            prev_rate = round(prev_w / prev_ob * 100, 2) if prev_ob > 0 else 0
+            is_consecutive = curr_rate > 5 and prev_rate > 5
+            entry = {
+                "store_id": sid,
+                "current_waste_amount": round(curr_w, 2),
+                "current_outbound_value": round(curr_ob, 2),
+                "current_waste_rate": curr_rate,
+                "prev_waste_amount": round(prev_w, 2),
+                "prev_outbound_value": round(prev_ob, 2),
+                "prev_waste_rate": prev_rate,
+                "is_consecutive_high": is_consecutive
+            }
+            items.append(entry)
+            if is_consecutive:
+                flagged.append(entry)
+        items.sort(key=lambda x: x["current_waste_rate"], reverse=True)
+        flagged.sort(key=lambda x: x["current_waste_rate"], reverse=True)
+        for e in items:
+            e["is_consecutive_high"] = bool(e["is_consecutive_high"])
+        for e in flagged:
+            e["is_consecutive_high"] = bool(e["is_consecutive_high"])
+    else:
+        items, flagged = [], []
+    stores = {
+        "current_period": f"{start.isoformat()} ~ {end.isoformat()}",
+        "prev_period": f"{prev_start.isoformat()} ~ {prev_end.isoformat()}",
+        "total_stores": len(items),
+        "flagged_count": len(flagged),
+        "items": items,
+        "flagged": flagged,
+        "has_flagged": bool(len(flagged) > 0)
+    }
+
+    L = []
+    L.append(f"# 📋 餐饮中央厨房每日运营摘要")
+    L.append(f"> 报告日期：**{rd.isoformat()}**  生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    L.append("## 一、关键指标速览\n")
+    L.append("| 模块 | 指标 | 数值 |")
+    L.append("|------|------|------|")
+    L.append(f"| 📦 补货预警 | 需补货原料数 | **{restock['total']}** 种 |")
+    L.append(f"| 📦 补货预警 | 紧急/高风险 | {restock['urgent_count']} / {restock['high_count']} 种 |")
+    L.append(f"| 📦 补货预警 | 预估采购额 | ¥ {restock['total_estimated_cost']:,.2f} |")
+    L.append(f"| 📈 预测误差 | 近7天预测不准原料 | **{fcerrors['total']}** 种 |")
+    L.append(f"| 🗑️  高损耗门店 | 连续两周>5% | **{stores['flagged_count']}** 家 |")
+    L.append(f"| 🗑️  高损耗门店 | 当期周期 | {stores['current_period']} |")
+    L.append(f"| 🗑️  高损耗门店 | 对比周期 | {stores['prev_period']} |")
+    L.append("\n## 二、补货建议清单\n")
+    if restock["items"]:
+        L.append("| 优先级 | 原料名称 | 分类 | 现库存 | 在途 | 有效库存 | 明日预测 | 缺口 | 建议采购 | 可支撑天数 | 风险 |")
+        L.append("|--------|----------|------|--------|------|----------|----------|------|----------|------------|------|")
+        risk_icon = {"urgent": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
+        for a in restock["items"]:
+            fc = f"{a['forecast_qty_tomorrow']:.1f}" if a['forecast_qty_tomorrow'] else "-"
+            L.append(
+                f"| {risk_icon.get(a['risk_level'], '')} {a['risk_level']} | "
+                f"{a['ingredient_name']} | {a['category']} | "
+                f"{a['current_stock']:.1f}{a['unit']} | {a['in_transit_qty']:.1f}{a['unit']} | {a['effective_qty']:.1f}{a['unit']} | "
+                f"{fc}{a['unit']} | {a['shortfall']:+.1f}{a['unit']} | "
+                f"{a['suggested_purchase_qty']:.1f}{a['unit']} | {a['days_supported']:.1f}天 | "
+                f"¥{a['estimated_cost']:,.2f} |"
+            )
+    else:
+        L.append("✅ 所有原料库存充足，暂无补货需求")
+    L.append("\n## 三、近7天预测不准清单（误差>30%）\n")
+    if fcerrors["items"]:
+        L.append(f"> 统计周期：{fcerrors['period']}\n")
+        L.append("| 原料 | 分类 | 超标次数 | 平均误差率 | 最近误差率 | 最近日期 | 最近预测 vs 实际 |")
+        L.append("|------|------|----------|------------|------------|----------|------------------|")
+        for f in fcerrors["items"]:
+            L.append(
+                f"| {f['ingredient_name']} | {f['category']} | {f['flagged_count']} 次 | "
+                f"{f['avg_error_rate']:.1f}% | {f['last_error_rate']:.1f}% | "
+                f"{f['last_date']} | {f['last_forecast']:.1f} vs {f['last_actual']:.1f} |"
+            )
+        L.append("\n> 💡 以上原料建议采购负责人结合实际经营情况复盘预测模型，或调整促销录入口径")
+    else:
+        L.append("✅ 近7天所有原料预测误差均在30%以内，预测质量良好")
+    L.append("\n## 四、门店损耗率监控（连续两周>5%标红）\n")
+    if stores["flagged"]:
+        L.append(f"> 当期周期 {stores['current_period']}  |  上期周期 {stores['prev_period']}\n")
+        L.append("| 门店 | 当期损耗率 | 当期损耗额 | 上期损耗率 | 上期损耗额 | 状态 |")
+        L.append("|------|------------|------------|------------|------------|------|")
+        for s in stores["flagged"]:
+            L.append(
+                f"| 🔴 **{s['store_id']}** | {s['current_waste_rate']:.2f}% | ¥{s['current_waste_amount']:,.2f} | "
+                f"{s['prev_waste_rate']:.2f}% | ¥{s['prev_waste_amount']:,.2f} | **连续超标** |"
+            )
+        L.append("\n> 🚨 以上门店连续两周损耗率均超过5%警戒线，**请管理组现场核查后厨管理与存储流程**")
+    else:
+        L.append(f"> 当期周期 {stores['current_period']}  |  上期周期 {stores['prev_period']}\n")
+        L.append("✅ **无连续两周高损耗门店**，所有门店损耗率均在正常范围（或单周超标但未连续两周）")
+    L.append("\n## 五、所有门店损耗率一览\n")
+    if stores["items"]:
+        L.append("| 门店 | 当期损耗率 | 当期损耗额 | 上期损耗率 | 上期损耗额 | 状态 |")
+        L.append("|------|------------|------------|------------|------------|------|")
+        for s in stores["items"]:
+            if s["is_consecutive_high"]:
+                flag = "🔴 连续两周超标"
+            elif s["current_waste_rate"] > 5:
+                flag = "🟡 当期超标"
+            else:
+                flag = "🟢 正常"
+            L.append(
+                f"| {s['store_id']} | {s['current_waste_rate']:.2f}% | ¥{s['current_waste_amount']:,.2f} | "
+                f"{s['prev_waste_rate']:.2f}% | ¥{s['prev_waste_amount']:,.2f} | {flag} |"
+            )
+    else:
+        L.append("无门店数据")
+    md_text = "\n".join(L)
+
+    if markdown_only:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(md_text, media_type="text/markdown; charset=utf-8")
+
+    return {"code": 0, "data": {
+        "report_date": rd.isoformat(),
+        "generated_at": datetime.now().isoformat(),
+        "markdown": md_text,
+        "restock": restock,
+        "forecast_errors": fcerrors,
+        "stores": stores,
+    }}
 
 
 # ========== 系统工具 ==========
